@@ -1,7 +1,7 @@
 """
 Stadium score server.
 
-Polls the NBA live scoreboard (nba_api) in a background thread and serves the
+Polls ESPN's public NBA scoreboard in a background thread and serves the
 current game as small flat JSON at /score for the ESP32 to poll.
 
 Every time something worth reacting to happens (a basket, a new quarter, the
@@ -11,20 +11,26 @@ only has to remember the last `seq` it saw and act when it changes.
 
 import logging
 import os
-import re
 import threading
 import time
 
+import requests
 from flask import Flask, jsonify
-from nba_api.live.nba.endpoints import scoreboard
+
+SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 
 # Team to follow by tricode, e.g. "LAL". Blank = follow the first live game.
 TEAM = os.environ.get("TEAM", "").strip().upper()
 LIVE_POLL_SECONDS = float(os.environ.get("LIVE_POLL_SECONDS", 5))
 IDLE_POLL_SECONDS = float(os.environ.get("IDLE_POLL_SECONDS", 60))
+ERROR_POLL_SECONDS = 10
 
-# NBA gameStatus values
+# Game status values sent to the ESP32
 PREGAME, LIVE, FINAL = 1, 2, 3
+ESPN_STATES = {"pre": PREGAME, "in": LIVE, "post": FINAL}
+
+# ESPN abbreviations that differ from the NBA tricodes the firmware uses.
+ESPN_TO_NBA = {"GS": "GSW", "NO": "NOP", "NY": "NYK", "SA": "SAS", "UTAH": "UTA", "WSH": "WAS"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stadium")
@@ -45,52 +51,66 @@ state = {
     "away_tri": "",
     "away_score": 0,
     "away_delta": 0,
-    "ok": False,          # last NBA fetch succeeded
+    "ok": False,          # last scoreboard fetch succeeded
+    "error": "",          # why the last fetch failed, if it did
     "updated": 0,         # unix time of last successful fetch
 }
 games_today = []
 
 
-def format_clock(iso_clock):
-    """'PT05M32.00S' -> '5:32'. Empty string between periods / when not live."""
-    m = re.match(r"PT(\d+)M(\d+)", iso_clock or "")
-    if not m:
-        return ""
-    return f"{int(m.group(1))}:{m.group(2)}"
+def tricode(competitor):
+    abbr = competitor["team"]["abbreviation"]
+    return ESPN_TO_NBA.get(abbr, abbr)
+
+
+def normalize(event):
+    """Flatten one ESPN scoreboard event into just the fields we use."""
+    status = event["status"]
+    teams = {c["homeAway"]: c for c in event["competitions"][0]["competitors"]}
+    home, away = teams["home"], teams["away"]
+    live = status["type"]["state"] == "in"
+    return {
+        "game_id": event["id"],
+        "status": ESPN_STATES.get(status["type"]["state"], 0),
+        "status_text": status["type"]["shortDetail"],
+        "period": status["period"],
+        "clock": status["displayClock"] if live else "",
+        "home_tri": tricode(home),
+        "home_score": int(home.get("score") or 0),
+        "away_tri": tricode(away),
+        "away_score": int(away.get("score") or 0),
+    }
 
 
 def pick_game(games, current_id):
     if TEAM:
-        for g in games:
-            if TEAM in (g["homeTeam"]["teamTricode"], g["awayTeam"]["teamTricode"]):
-                return g
-        return None
+        return next((g for g in games if TEAM in (g["home_tri"], g["away_tri"])), None)
 
-    live = [g for g in games if g["gameStatus"] == LIVE]
+    live = [g for g in games if g["status"] == LIVE]
     if live:
         # Stay on the game we're already showing rather than hopping around.
-        return next((g for g in live if g["gameId"] == current_id), live[0])
+        return next((g for g in live if g["game_id"] == current_id), live[0])
     # Nothing live: keep showing the current game's final score if we have one,
     # otherwise show the next game to tip off.
-    current = next((g for g in games if g["gameId"] == current_id), None)
+    current = next((g for g in games if g["game_id"] == current_id), None)
     if current:
         return current
-    upcoming = [g for g in games if g["gameStatus"] == PREGAME]
+    upcoming = [g for g in games if g["status"] == PREGAME]
     return (upcoming or games or [None])[0]
 
 
 def apply_game(game):
-    home, away = game["homeTeam"], game["awayTeam"]
     with lock:
-        if game["gameId"] != state["game_id"]:
+        if game["game_id"] != state["game_id"]:
             event, home_delta, away_delta = "game", 0, 0
         else:
-            home_delta = home["score"] - state["home_score"]
-            away_delta = away["score"] - state["away_score"]
-            if home_delta or away_delta:
-                event = "score"
-            elif game["gameStatus"] != state["status"]:
+            home_delta = game["home_score"] - state["home_score"]
+            away_delta = game["away_score"] - state["away_score"]
+            # Status first so the final buzzer isn't masked by a last-second basket.
+            if game["status"] != state["status"]:
                 event = "status"
+            elif home_delta or away_delta:
+                event = "score"
             elif game["period"] != state["period"]:
                 event = "period"
             else:
@@ -101,31 +121,24 @@ def apply_game(game):
             state["event"] = event
             state["home_delta"] = home_delta
             state["away_delta"] = away_delta
-            log.info("%s: %s %d - %d %s (%s)", event, away["teamTricode"], away["score"],
-                     home["score"], home["teamTricode"], game["gameStatusText"].strip())
+            log.info("%s: %s %d - %d %s (%s)", event, game["away_tri"], game["away_score"],
+                     game["home_score"], game["home_tri"], game["status_text"])
 
-        state.update(
-            game_id=game["gameId"],
-            status=game["gameStatus"],
-            status_text=game["gameStatusText"].strip(),
-            period=game["period"],
-            clock=format_clock(game["gameClock"]),
-            home_tri=home["teamTricode"],
-            home_score=home["score"],
-            away_tri=away["teamTricode"],
-            away_score=away["score"],
-        )
+        state.update(game)
 
 
 def poll_once():
     global games_today
-    games = scoreboard.ScoreBoard(timeout=10).get_dict()["scoreboard"]["games"]
+    resp = requests.get(SCOREBOARD_URL, timeout=10)
+    resp.raise_for_status()
+    games = [normalize(e) for e in resp.json().get("events", [])]
     games_today = games
     game = pick_game(games, state["game_id"])
     if game:
         apply_game(game)
     with lock:
         state["ok"] = True
+        state["error"] = ""
         state["updated"] = int(time.time())
 
 
@@ -133,11 +146,14 @@ def poll_forever():
     while True:
         try:
             poll_once()
-        except Exception:
-            log.exception("NBA fetch failed")
+            delay = LIVE_POLL_SECONDS if state["status"] == LIVE else IDLE_POLL_SECONDS
+        except Exception as e:
+            log.exception("Scoreboard fetch failed")
             with lock:
                 state["ok"] = False
-        time.sleep(LIVE_POLL_SECONDS if state["status"] == LIVE else IDLE_POLL_SECONDS)
+                state["error"] = f"{type(e).__name__}: {e}"[:200]
+            delay = ERROR_POLL_SECONDS
+        time.sleep(delay)
 
 
 @app.get("/")
@@ -156,11 +172,11 @@ def games():
     """Today's games, handy for finding tricodes / checking what's on."""
     return jsonify([
         {
-            "game_id": g["gameId"],
-            "status": g["gameStatus"],
-            "status_text": g["gameStatusText"].strip(),
-            "away": f'{g["awayTeam"]["teamTricode"]} {g["awayTeam"]["score"]}',
-            "home": f'{g["homeTeam"]["teamTricode"]} {g["homeTeam"]["score"]}',
+            "game_id": g["game_id"],
+            "status": g["status"],
+            "status_text": g["status_text"],
+            "away": f'{g["away_tri"]} {g["away_score"]}',
+            "home": f'{g["home_tri"]} {g["home_score"]}',
         }
         for g in games_today
     ])

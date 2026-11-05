@@ -56,6 +56,7 @@ state = {
     "updated": 0,         # unix time of last successful fetch
 }
 games_today = []
+poller_pid = None  # process the poll thread is running in
 
 
 def tricode(competitor):
@@ -156,6 +157,24 @@ def poll_forever():
         time.sleep(delay)
 
 
+@app.before_request
+def ensure_poller():
+    """Start the poll thread in whichever process is serving requests.
+
+    Starting it at import breaks under gunicorn --preload (or several workers):
+    the app is imported in the master, the thread stays there, and the forked
+    worker serving /score keeps the empty state forever.
+    """
+    global poller_pid
+    if poller_pid == os.getpid():
+        return
+    with lock:
+        if poller_pid != os.getpid():
+            poller_pid = os.getpid()
+            threading.Thread(target=poll_forever, daemon=True).start()
+            log.info("Poller started in pid %d", poller_pid)
+
+
 @app.get("/")
 def health():
     return "ok"
@@ -181,9 +200,6 @@ def games():
         for g in games_today
     ])
 
-
-# Started at import so it also runs under gunicorn (use a single worker).
-threading.Thread(target=poll_forever, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
